@@ -1,8 +1,7 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-// ── MCP Server (for AI clients like Claude Desktop, Cursor) ──
 export class ImageGenServer extends McpAgent {
   server = new McpServer({
     name: "stable-diffusion-xl",
@@ -36,7 +35,6 @@ export class ImageGenServer extends McpAgent {
           }
         );
 
-        // Convert ReadableStream to base64 for MCP
         const reader = (result as ReadableStream).getReader();
         const chunks: Uint8Array[] = [];
         while (true) {
@@ -61,20 +59,18 @@ export class ImageGenServer extends McpAgent {
   }
 }
 
-// ── Mount the MCP server at /mcp (no auth) ──
-const mcpHandler = ImageGenServer.mount("/mcp");
+const mcpHandler = ImageGenServer.serve("/mcp");
 
-// ── Default export: routes /mcp to MCP, everything else to image endpoint ──
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // Route MCP traffic to the MCP server
+    // MCP endpoint — JSON-RPC 2.0 over Streamable HTTP
     if (url.pathname.startsWith("/mcp")) {
-      return mcpHandler.fetch(request, env, { waitUntil: () => {} });
+      return mcpHandler.fetch(request, env, ctx);
     }
 
-    // Otherwise, serve the image directly in the browser
+    // Browser image endpoint at /
     const prompt = url.searchParams.get("prompt") ?? "a cat in space, digital art";
 
     const result = await env.AI.run(
