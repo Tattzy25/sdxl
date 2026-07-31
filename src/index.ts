@@ -1,79 +1,56 @@
-import { createMcpHandler } from "agents/mcp";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 
-interface Env {
-  AI: Ai;
+export interface Env {
+  AI: Fetcher;
+  IMAGES: R2Bucket;
 }
 
-const mcpServer = new McpServer({
-  name: "tattty-sdxl",
-  version: "1.0.0",
-});
+async function streamToUint8Array(stream: ReadableStream): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const total = chunks.reduce((a, c) => a + c.length, 0);
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
 
-mcpServer.tool(
-  "generate-image",
-  "Generate a PNG image from a text prompt using Stable Diffusion XL.",
-  {
-    prompt: z
-      .string()
-      .min(1)
-      .max(2_000)
-      .describe("The image to generate"),
+function createServer(env: Env) {
+  const server = new McpServer({
+    name: "stable-diffusion-xl",
+    version: "1.0.0",
+  });
 
-    negative_prompt: z
-      .string()
-      .max(2_000)
-      .optional()
-      .describe("Things to avoid in the generated image"),
-
-    width: z
-      .number()
-      .int()
-      .min(256)
-      .max(2048)
-      .default(1024)
-      .describe("Image width in pixels"),
-
-    height: z
-      .number()
-      .int()
-      .min(256)
-      .max(2048)
-      .default(1024)
-      .describe("Image height in pixels"),
-
-    num_steps: z
-      .number()
-      .int()
-      .min(1)
-      .max(20)
-      .default(20)
-      .describe("Number of diffusion steps"),
-
-    guidance: z
-      .number()
-      .min(1)
-      .max(20)
-      .default(7.5)
-      .describe("Prompt guidance scale"),
-
-    seed: z
-      .number()
-      .int()
-      .optional()
-      .describe("Optional fixed seed for reproducibility"),
-  },
-
-  async (params, extra) => {
-    const env = extra.env as Env;
-
-    try {
+  server.registerTool(
+    "generate-image",
+    {
+      description: "Generate an image from a text prompt using Stable Diffusion XL",
+      inputSchema: {
+        prompt: z.string().min(1).describe("Text description of the image to generate"),
+        negative_prompt: z.string().optional().describe("Elements to avoid in the image"),
+        width: z.number().min(256).max(2048).default(1024).describe("Image width in pixels"),
+        height: z.number().min(256).max(2048).default(1024).describe("Image height in pixels"),
+        num_steps: z.number().max(20).default(20).describe("Diffusion steps (max 20)"),
+        guidance: z.number().default(7.5).describe("How closely to follow the prompt"),
+        seed: z.number().optional().describe("Random seed for reproducibility"),
+      },
+    },
+    async (params) => {
       const result = await env.AI.run(
         "@cf/stabilityai/stable-diffusion-xl-base-1.0",
         {
           prompt: params.prompt,
-          negative_prompt: params.negative_prompt ?? "blurry, low quality",
+          negative_prompt: params.negative_prompt,
           width: params.width,
           height: params.height,
           num_steps: params.num_steps,
@@ -82,105 +59,48 @@ mcpServer.tool(
         }
       );
 
-      const bytes = new Uint8Array(
-        await new Response(result as ReadableStream).arrayBuffer()
-      );
+      const imageBytes = await streamToUint8Array(result as ReadableStream);
 
-      // Avoid String.fromCharCode(...bytes), which can exceed the
-      // JavaScript argument limit for a full-size generated PNG.
-      let binary = "";
-      const chunkSize = 32_768;
-
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        binary += String.fromCharCode(
-          ...bytes.subarray(i, i + chunkSize)
-        );
-      }
+      const key = `${crypto.randomUUID()}.png`;
+      await env.IMAGES.put(key, imageBytes, {
+        httpMetadata: { contentType: "image/png" },
+      });
 
       return {
-        content: [
-          {
-            type: "image",
-            data: btoa(binary),
-            mimeType: "image/png",
-          },
-        ],
-      };
-    } catch (error) {
-      console.error("SDXL generation failed", error);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: error instanceof Error
-              ? `Image generation failed: ${error.message}`
-              : "Image generation failed",
-          },
-        ],
-        isError: true,
+        content: [{ type: "text", text: `https://imagine.tattty.com/${key}` }],
       };
     }
-  }
-);
+  );
 
-// This is the actual MCP server handler.
-// It handles initialize, notifications/initialized, tools/list, and tools/call.
-const mcpHandler = createMcpHandler(mcpServer);
+  return server;
+}
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // MCP endpoint:
-    // https://sdxl.tattty.com/mcp
-    if (url.pathname === "/mcp") {
-      return mcpHandler(request, env, ctx);
+    // MCP endpoint
+    if (url.pathname.startsWith("/mcp")) {
+      return createMcpHandler(() => createServer(env))(request, env, ctx);
     }
 
-    // Optional direct non-MCP endpoint for your TaTTTy UI.
-    // GET /generate?prompt=blackwork+dragon+tattoo
-    if (url.pathname === "/generate") {
-      const prompt = url.searchParams.get("prompt");
+    // Browser image endpoint at /
+    const prompt = url.searchParams.get("prompt") ?? "a cat in space, digital art";
 
-      if (!prompt) {
-        return Response.json(
-          { error: "Missing required ?prompt= parameter" },
-          { status: 400 }
-        );
+    const result = await env.AI.run(
+      "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+      {
+        prompt,
+        negative_prompt: "blurry, low quality",
+        width: 1024,
+        height: 1024,
+        num_steps: 20,
+        guidance: 7.5,
       }
+    );
 
-      const result = await env.AI.run(
-        "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-        {
-          prompt,
-          negative_prompt:
-            url.searchParams.get("negative_prompt") ??
-            "blurry, low quality",
-          width: 1024,
-          height: 1024,
-          num_steps: 20,
-          guidance: 7.5,
-        }
-      );
-
-      return new Response(result as ReadableStream, {
-        headers: {
-          "content-type": "image/png",
-          "cache-control": "no-store",
-        },
-      });
-    }
-
-    return Response.json({
-      name: "TaTTTy SDXL MCP Server",
-      mcpEndpoint: "https://sdxl.tattty.com/mcp",
-      directImageEndpoint:
-        "https://sdxl.tattty.com/generate?prompt=YOUR_PROMPT",
+    return new Response(result, {
+      headers: { "content-type": "image/png" },
     });
   },
-};
+} satisfies ExportedHandler<Env>;
