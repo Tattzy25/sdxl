@@ -25,6 +25,29 @@ async function streamToUint8Array(stream: ReadableStream): Promise<Uint8Array> {
   return merged;
 }
 
+async function generateImage(env: Env, prompt: string, negative_prompt: string | undefined, customer_id: string): Promise<string> {
+  const result = await env.AI.run(
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+    {
+      prompt,
+      negative_prompt,
+      width: 1024,
+      height: 1024,
+      num_steps: 20,
+      guidance: 7.5,
+    }
+  );
+
+  const imageBytes = await streamToUint8Array(result as ReadableStream);
+
+  const key = `${customer_id}${Math.floor(1000 + Math.random() * 9000)}.png`;
+  await env.IMAGES.put(key, imageBytes, {
+    httpMetadata: { contentType: "image/png" },
+  });
+
+  return `https://imagine.tattty.com/${key}`;
+}
+
 function createServer(env: Env) {
   const server = new McpServer({
     name: "stable-diffusion-xl",
@@ -38,36 +61,13 @@ function createServer(env: Env) {
       inputSchema: {
         prompt: z.string().min(1).describe("Text description of the image to generate"),
         negative_prompt: z.string().optional().describe("Elements to avoid in the image"),
-        width: z.number().min(256).max(2048).default(1024).describe("Image width in pixels"),
-        height: z.number().min(256).max(2048).default(1024).describe("Image height in pixels"),
-        num_steps: z.number().max(20).default(20).describe("Diffusion steps (max 20)"),
-        guidance: z.number().default(7.5).describe("How closely to follow the prompt"),
-        seed: z.number().optional().describe("Random seed for reproducibility"),
+        customer_id: z.string().min(1).describe("Customer ID used to namespace the stored image"),
       },
     },
     async (params) => {
-      const result = await env.AI.run(
-        "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-        {
-          prompt: params.prompt,
-          negative_prompt: params.negative_prompt,
-          width: params.width,
-          height: params.height,
-          num_steps: params.num_steps,
-          guidance: params.guidance,
-          seed: params.seed,
-        }
-      );
-
-      const imageBytes = await streamToUint8Array(result as ReadableStream);
-
-      const key = `${crypto.randomUUID()}.png`;
-      await env.IMAGES.put(key, imageBytes, {
-        httpMetadata: { contentType: "image/png" },
-      });
-
+      const url = await generateImage(env, params.prompt, params.negative_prompt, params.customer_id);
       return {
-        content: [{ type: "text", text: `https://imagine.tattty.com/${key}` }],
+        content: [{ type: "text", text: url }],
       };
     }
   );
@@ -84,23 +84,15 @@ export default {
       return createMcpHandler(() => createServer(env))(request, env, ctx);
     }
 
-    // Browser image endpoint at /
-    const prompt = url.searchParams.get("prompt") ?? "a cat in space, digital art";
+    // Plain HTTP endpoint — returns ONLY the image URL as raw text
+    if (url.pathname === "/generate") {
+      const body = await request.json<{ prompt: string; negative_prompt?: string; customer_id: string }>();
+      const imageUrl = await generateImage(env, body.prompt, body.negative_prompt, body.customer_id);
+      return new Response(imageUrl, {
+        headers: { "content-type": "text/plain" },
+      });
+    }
 
-    const result = await env.AI.run(
-      "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-      {
-        prompt,
-        negative_prompt: "blurry, low quality",
-        width: 1024,
-        height: 1024,
-        num_steps: 20,
-        guidance: 7.5,
-      }
-    );
-
-    return new Response(result, {
-      headers: { "content-type": "image/png" },
-    });
+    return new Response("Not found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
