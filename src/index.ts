@@ -17,10 +17,10 @@ async function streamToUint8Array(stream: ReadableStream): Promise<Uint8Array> {
     chunks.push(value);
   }
 
-  const total = chunks.reduce((a, c) => a + c.length, 0);
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
   const merged = new Uint8Array(total);
-  let offset = 0;
 
+  let offset = 0;
   for (const chunk of chunks) {
     merged.set(chunk, offset);
     offset += chunk.length;
@@ -29,20 +29,10 @@ async function streamToUint8Array(stream: ReadableStream): Promise<Uint8Array> {
   return merged;
 }
 
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = "";
-
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-
-  return btoa(binary);
-}
-
-async function imageUrlToBase64(imageUrl: string): Promise<string> {
+async function imageUrlToBytes(imageUrl: string): Promise<number[]> {
   const response = await fetch(imageUrl);
   const bytes = new Uint8Array(await response.arrayBuffer());
-  return uint8ArrayToBase64(bytes);
+  return Array.from(bytes);
 }
 
 async function generateImage(
@@ -52,6 +42,8 @@ async function generateImage(
   customer_id: string,
   image_url?: string
 ): Promise<string> {
+  const hasImage = Boolean(image_url?.trim());
+
   const input: Record<string, unknown> = {
     prompt,
     negative_prompt,
@@ -61,22 +53,25 @@ async function generateImage(
     guidance: 7.5,
   };
 
-  if (image_url) {
-    input.image_b64 = await imageUrlToBase64(image_url);
+  if (hasImage) {
+    input.image = await imageUrlToBytes(image_url!);
     input.strength = 0.65;
   }
 
-  const result = await env.AI.run(
-    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-    input
-  );
+  const model = hasImage
+    ? "@cf/runwayml/stable-diffusion-v1-5-img2img"
+    : "@cf/stabilityai/stable-diffusion-xl-base-1.0";
+
+  const result = await env.AI.run(model, input);
 
   const imageBytes = await streamToUint8Array(result as ReadableStream);
 
   const key = `${customer_id}${Math.floor(1000 + Math.random() * 9000)}.png`;
 
   await env.IMAGES.put(key, imageBytes, {
-    httpMetadata: { contentType: "image/png" },
+    httpMetadata: {
+      contentType: "image/png",
+    },
   });
 
   return `https://imagine.tattty.com/${key}`;
@@ -91,12 +86,13 @@ function createServer(env: Env) {
   server.registerTool(
     "generate-image",
     {
-      description: "Generate or edit an image using Stable Diffusion XL",
+      description:
+        "Generate an image from text, or edit an existing image when image_url is supplied",
       inputSchema: {
         prompt: z.string().min(1),
         negative_prompt: z.string().optional(),
         customer_id: z.string().min(1),
-        image_url: z.string().url().optional(),
+        image_url: z.string().url().optional().or(z.literal("")),
       },
     },
     async (params) => {
@@ -109,7 +105,12 @@ function createServer(env: Env) {
       );
 
       return {
-        content: [{ type: "text", text: url }],
+        content: [
+          {
+            type: "text",
+            text: url,
+          },
+        ],
       };
     }
   );
@@ -146,10 +147,14 @@ export default {
       );
 
       return new Response(imageUrl, {
-        headers: { "content-type": "text/plain" },
+        headers: {
+          "content-type": "text/plain",
+        },
       });
     }
 
-    return new Response("Not found", { status: 404 });
+    return new Response("Not found", {
+      status: 404,
+    });
   },
 } satisfies ExportedHandler<Env>;
