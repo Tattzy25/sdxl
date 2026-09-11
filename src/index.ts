@@ -25,13 +25,10 @@ async function streamToUint8Array(stream: ReadableStream): Promise<Uint8Array> {
   return merged;
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
+async function imageUrlToBytes(imageUrl: string): Promise<number[]> {
+  const response = await fetch(imageUrl);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return Array.from(bytes);
 }
 
 async function generateImage(
@@ -40,25 +37,27 @@ async function generateImage(
   negative_prompt: string | undefined,
   image_url: string | undefined
 ): Promise<string> {
-  let image_b64: string | undefined;
-  if (image_url) {
-    const imgResp = await fetch(image_url);
-    const imgBytes = await streamToUint8Array(imgResp.body as ReadableStream);
-    image_b64 = bytesToBase64(imgBytes);
+  const hasImage = Boolean(image_url?.trim());
+
+  const input: Record<string, unknown> = {
+    prompt,
+    negative_prompt,
+    width: 1024,
+    height: 1024,
+    num_steps: 20,
+    guidance: 7.5,
+  };
+
+  if (hasImage) {
+    input.image = await imageUrlToBytes(image_url!);
+    input.strength = 0.65;
   }
 
-  const result = await env.AI.run(
-    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
-    {
-      prompt,
-      negative_prompt,
-      width: 1024,
-      height: 1024,
-      num_steps: 20,
-      guidance: 7.5,
-      ...(image_b64 ? { image_b64, strength: 0.65 } : {}),
-    }
-  );
+  const model = hasImage
+    ? "@cf/runwayml/stable-diffusion-v1-5-img2img"
+    : "@cf/stabilityai/stable-diffusion-xl-base-1.0";
+
+  const result = await env.AI.run(model, input);
 
   const imageBytes = await streamToUint8Array(result as ReadableStream);
 
